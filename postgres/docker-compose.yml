@@ -38,7 +38,9 @@ services:
       POSTGRES_USER: claude
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sessions}
       POSTGRES_EXTRA_OPTS: "--clean --if-exists --compress=gzip:5"
-      SCHEDULE: "@daily"
+      # 02:15 UTC, clear of the 00:00 UTC burst of backup pings to Healthchecks on the same
+      # host: the dump saturates the disk for about five minutes.
+      SCHEDULE: "15 2 * * *"
       BACKUP_KEEP_DAYS: "7"
       BACKUP_KEEP_WEEKS: "4"
       BACKUP_KEEP_MONTHS: "6"
