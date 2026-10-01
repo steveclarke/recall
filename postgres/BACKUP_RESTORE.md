@@ -5,10 +5,10 @@
 The `pgbackup` service (image: `prodrigestivill/postgres-backup-local`)
 runs alongside the DB in `docker-compose.yml`. It:
 
-- Runs `pg_dump` on the `claude_sessions` DB daily at 00:00 UTC
+- Runs `pg_dump` on the `claude_sessions` DB daily at 02:15 UTC
 - Gzips the output
 - Writes to the host-mounted `./backups/` directory
-- Retains: 14 daily, 4 weekly, 6 monthly dumps
+- Retains the last two nights on dockervm (`BACKUP_KEEP_DAYS` 1, weeks and months 0)
 - Uses `--clean --if-exists` so restores emit `DROP` statements first
 
 ## File layout on the host
@@ -24,6 +24,16 @@ runs alongside the DB in `docker-compose.yml`. It:
 ```
 
 `last/` always points to the newest dump — use that for routine restores.
+
+## Copies on storage.home
+
+Every dump is a full copy of the archive, so history is not kept on
+dockervm's disk. storage.home's nightly `dockervm-backup` User Script
+(04:30 Newfoundland time) pulls `daily/claude_sessions-latest.sql.gz` to
+`backups-clarke/dockervm/recall-YYYYMMDD.sql.gz` and keeps seven. Kopia
+carries that folder to B2. A dump older than 30 hours fails that job's
+Healthchecks check. Restore from one of those copies the same way as below,
+after copying it back to dockervm.
 
 ## Manual one-off backup
 
@@ -81,9 +91,6 @@ ls -lht backups/daily | head -5
 
 ## What's NOT covered by this
 
-- **Offsite backups.** Everything lives on dockervm. Add a B2/S3
-  sync job once the dataset matters enough. See "Extension ideas" in
-  `infrastructure/recall.md`.
 - **Point-in-time recovery.** We dump once a day; up to 24h of sync'd
   sessions could be lost. Acceptable for now — the JSONL source files
   on each machine are the real source of truth.

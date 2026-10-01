@@ -20,9 +20,11 @@ services:
       retries: 5
 
   # Daily pg_dump backups with rotation.
-  # Keeps last 7 daily, 4 weekly, 6 monthly dumps under ./backups.
-  # Dumps are full and the data is append-only, so consecutive dailies are
-  # near-identical; 7 covers day-granular recovery without the storage cost.
+  # Keeps the last two nights under ./backups (KEEP_DAYS 1 = today and
+  # yesterday; the weekly and monthly copies are hard links inside that window).
+  # Each dump is a full copy of a growing archive, so local history is kept off
+  # this disk: storage.home pulls the newest dump nightly and keeps a week of
+  # them (see BACKUP_RESTORE.md).
   # Times are UTC. BACKUP_OPTIONS uses --clean to emit DROP statements for
   # safer restores.
   pgbackup:
@@ -41,9 +43,9 @@ services:
       # 02:15 UTC, clear of the 00:00 UTC burst of backup pings to Healthchecks on the same
       # host: the dump saturates the disk for about five minutes.
       SCHEDULE: "15 2 * * *"
-      BACKUP_KEEP_DAYS: "7"
-      BACKUP_KEEP_WEEKS: "4"
-      BACKUP_KEEP_MONTHS: "6"
+      BACKUP_KEEP_DAYS: "1"
+      BACKUP_KEEP_WEEKS: "0"
+      BACKUP_KEEP_MONTHS: "0"
       HEALTHCHECK_PORT: "8080"
     volumes:
       - ./backups:/backups
