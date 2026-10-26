@@ -4,24 +4,37 @@
  *
  * Usage:
  *   bun run postgres/sync.ts                    # Incremental sync (new/changed)
- *   bun run postgres/sync.ts --all              # Full sync
  *   bun run postgres/sync.ts --days 7           # Last 7 days only
- *   bun run postgres/sync.ts --force            # Re-sync even if unchanged
+ *   bun run postgres/sync.ts --force            # Rebuild every session from byte 0
  *
  * Environment:
  *   DATABASE_URL          - PostgreSQL connection string
  *   CLAUDE_SESSIONS_DIR   - Sessions directory (default: ~/.claude/projects)
+ *
+ * How it stays cheap (the same model as log shippers such as promtail or
+ * Vector): each session row records how many bytes of its JSONL have been
+ * read (`source_offset`) and the file size at that read (`source_size`).
+ * A file whose size has not changed is skipped on a stat alone. A file that
+ * grew is read from its checkpoint, line by line; the new lines are added
+ * to the stored totals and appended to `transcript_chunks`, in the same
+ * transaction that moves the checkpoint, so a crash never doubles or loses
+ * lines. Memory is bounded by one transcript chunk, whatever the file size.
  */
 
-import { readdirSync, statSync, readFileSync } from 'fs';
+import { readdirSync, statSync } from 'fs';
 import { hostname } from 'os';
 import { join } from 'path';
-import { createHash } from 'crypto';
 import { parseArgs } from 'util';
 import postgres from 'postgres';
-import { parseSessionFile, getSearchableText } from '../shared/parser.js';
+import {
+  SessionAccumulator,
+  emptyAggregates,
+  isSkippedLine,
+  readLines,
+  sessionIdFromPath,
+} from '../shared/parser.js';
 import { redactString, redactTree } from '../shared/redact.js';
-import type { ParsedSession } from '../shared/types.js';
+import type { SessionAggregates } from '../shared/types.js';
 
 // Configuration
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://localhost/claude_sessions';
@@ -31,10 +44,12 @@ const DEFAULT_SESSIONS_DIR =
 // RECALL_HOSTNAME overrides the hostname stamped on rows. Primarily used
 // for one-time imports from a retired machine where os.hostname() on the
 // importing host doesn't reflect where the sessions originally came from.
-// Accepts the legacy KUATO_HOSTNAME name too for any scheduler configs
-// that haven't been migrated yet.
-const HOSTNAME =
-  process.env.RECALL_HOSTNAME || process.env.KUATO_HOSTNAME || hostname();
+const HOSTNAME = process.env.RECALL_HOSTNAME || hostname();
+
+// Transcript lines are stored in rows of about this many source bytes. Small
+// enough that a chunk is cheap to hold, redact and send; far under the
+// 256 MB jsonb array limit, so no transcript is ever truncated.
+const CHUNK_BYTES = 8 * 1024 * 1024;
 
 // Connect to database
 //
@@ -52,95 +67,43 @@ const sql = postgres(DATABASE_URL, {
 });
 
 interface SyncOptions {
-  all?: boolean;
   days?: number;
   force?: boolean;
   limit?: number;
 }
 
-interface SyncStats {
-  created: number;
-  updated: number;
-  skipped: number;
-  errors: number;
+type SyncResult = 'created' | 'appended' | 'rebuilt' | 'skipped' | 'error';
+type SyncStats = Record<SyncResult, number>;
+
+interface Checkpoint {
+  size: number;
+  offset: number;
 }
 
-// Postgres caps the combined size of a jsonb array's elements at 256MB
-// (jsonb_util.c, "total size of jsonb array elements exceeds the maximum").
-// A handful of very long sessions exceed that and would fail the whole insert,
-// losing the metadata and search text along with the transcript. Cap well
-// under the hard limit — jsonb's binary form carries per-key overhead the
-// serialized length doesn't account for.
-const MAX_TRANSCRIPT_BYTES = 128 * 1024 * 1024;
-
-/**
- * Trim an oversized transcript to fit the jsonb array limit.
- *
- * Keeps the head and tail of the conversation — where the task and its
- * outcome live — and replaces the middle with a marker recording how many
- * messages were dropped. Returns the transcript unchanged when it already
- * fits. The full JSONL always remains on disk at transcript_path.
- */
-function capTranscript(messages: unknown[]): {
-  transcript: unknown[];
-  droppedMessages: number;
-} {
-  if (Buffer.byteLength(JSON.stringify(messages)) <= MAX_TRANSCRIPT_BYTES) {
-    return { transcript: messages, droppedMessages: 0 };
-  }
-
-  // Walk inward from both ends, taking whichever side is currently smaller so
-  // head and tail grow together, until the next message would breach the cap.
-  const sizes = messages.map((m) => Buffer.byteLength(JSON.stringify(m)) + 1);
-  const budget = MAX_TRANSCRIPT_BYTES - 1024; // room for the marker object
-  let used = 0;
-  let head = 0;
-  let tail = 0;
-
-  while (head + tail < messages.length) {
-    const takeHead = head <= tail;
-    const index = takeHead ? head : messages.length - 1 - tail;
-    if (used + sizes[index] > budget) break;
-    used += sizes[index];
-    if (takeHead) head++;
-    else tail++;
-  }
-
-  const dropped = messages.length - head - tail;
-  if (dropped <= 0) {
-    return { transcript: messages, droppedMessages: 0 };
-  }
-
-  return {
-    transcript: [
-      ...messages.slice(0, head),
-      {
-        _recall_truncated: true,
-        dropped_messages: dropped,
-        reason: `Transcript exceeded ${MAX_TRANSCRIPT_BYTES} bytes; middle removed. Full transcript remains in the source JSONL.`,
-      },
-      ...messages.slice(messages.length - tail),
-    ],
-    droppedMessages: dropped,
-  };
+interface SessionFile {
+  path: string;
+  size: number;
+  mtime: Date;
 }
 
-/**
- * Calculate MD5 hash of file contents
- */
-function fileHash(filePath: string): string {
-  const content = readFileSync(filePath);
-  return createHash('md5').update(content).digest('hex');
-}
+/** Thrown inside a transaction to roll back a file with no conversation yet. */
+class NoConversation extends Error {}
 
 /**
- * Get existing session hashes from database
+ * Checkpoints for every session that has one. Session ids are UUIDs, unique
+ * across machines, so no hostname filter is needed.
  */
-async function getExistingHashes(): Promise<Map<string, string>> {
+async function getCheckpoints(): Promise<Map<string, Checkpoint>> {
   const rows = await sql`
-    SELECT id, transcript_hash FROM sessions WHERE transcript_hash IS NOT NULL
+    SELECT id, source_size, source_offset FROM sessions
+    WHERE source_offset IS NOT NULL
   `;
-  return new Map(rows.map((r) => [r.id, r.transcript_hash]));
+  return new Map(
+    rows.map((r) => [
+      r.id,
+      { size: Number(r.source_size), offset: Number(r.source_offset) },
+    ])
+  );
 }
 
 /**
@@ -165,18 +128,13 @@ function findSessionDirs(baseDir: string): string[] {
 /**
  * Find JSONL files to sync
  */
-function findFilesToSync(
-  baseDir: string,
-  options: SyncOptions
-): { path: string; mtime: Date }[] {
-  const files: { path: string; mtime: Date }[] = [];
-  const sessionDirs = findSessionDirs(baseDir);
-
+function findFilesToSync(baseDir: string, options: SyncOptions): SessionFile[] {
+  const files: SessionFile[] = [];
   const cutoffDate = options.days
     ? new Date(Date.now() - options.days * 24 * 60 * 60 * 1000)
     : null;
 
-  for (const dir of sessionDirs) {
+  for (const dir of findSessionDirs(baseDir)) {
     try {
       for (const file of readdirSync(dir)) {
         if (!file.endsWith('.jsonl')) continue;
@@ -187,7 +145,7 @@ function findFilesToSync(
         // Skip old files unless doing full sync
         if (cutoffDate && stat.mtime < cutoffDate) continue;
 
-        files.push({ path: filePath, mtime: stat.mtime });
+        files.push({ path: filePath, size: stat.size, mtime: stat.mtime });
       }
     } catch {
       // Directory not readable
@@ -197,134 +155,160 @@ function findFilesToSync(
   // Sort by modification time (newest first)
   files.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
 
-  // Apply limit
-  if (options.limit) {
-    return files.slice(0, options.limit);
-  }
+  return options.limit ? files.slice(0, options.limit) : files;
+}
 
-  return files;
+/**
+ * Stored totals for a session, locked for the rest of the transaction.
+ */
+async function lockAggregates(
+  tx: postgres.TransactionSql,
+  id: string
+): Promise<SessionAggregates | null> {
+  const [row] = await tx`
+    SELECT started_at, ended_at, git_branch, cwd, version, message_count,
+           input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+           user_messages, tools_used, files_touched, models_used, model_tokens
+    FROM sessions WHERE id = ${id}
+    FOR UPDATE
+  `;
+  if (!row) return null;
+  return {
+    startedAt: row.started_at?.toISOString() ?? null,
+    endedAt: row.ended_at?.toISOString() ?? null,
+    gitBranch: row.git_branch,
+    cwd: row.cwd,
+    version: row.version,
+    messageCount: row.message_count,
+    inputTokens: Number(row.input_tokens),
+    outputTokens: Number(row.output_tokens),
+    cacheCreationTokens: Number(row.cache_creation_tokens),
+    cacheReadTokens: Number(row.cache_read_tokens),
+    userMessages: row.user_messages,
+    toolsUsed: row.tools_used,
+    filesFromToolCalls: row.files_touched,
+    modelsUsed: row.models_used,
+    modelTokens: row.model_tokens,
+  };
 }
 
 /**
  * Sync a single session to the database
  */
 async function syncSession(
-  filePath: string,
-  existingHashes: Map<string, string>,
+  file: SessionFile,
+  checkpoint: Checkpoint | undefined,
   options: SyncOptions
-): Promise<'created' | 'updated' | 'skipped' | 'error'> {
+): Promise<SyncResult> {
+  const id = sessionIdFromPath(file.path);
+  if (!id) return 'skipped';
+
+  // Unchanged since the last read: decided on a stat, the file is never opened.
+  if (!options.force && checkpoint && checkpoint.size === file.size) {
+    return 'skipped';
+  }
+
+  // Start over when forced, when the session has never been read, or when
+  // the file is now shorter than what was read (replaced, not appended to).
+  const rebuild = options.force || !checkpoint || file.size < checkpoint.offset;
+  const start = rebuild ? 0 : checkpoint.offset;
+
   try {
-    // Parse session
-    const session = parseSessionFile(filePath);
-    if (!session) {
-      return 'skipped';
-    }
-
-    // Skip empty sessions
-    if (session.userMessages.length === 0) {
-      return 'skipped';
-    }
-
-    // Check if already synced with same hash
-    const hash = fileHash(filePath);
-    const existingHash = existingHashes.get(session.id);
-
-    if (existingHash === hash && !options.force) {
-      return 'skipped';
-    }
-
-    // Scrub profanity before anything hits the DB. Intentionally destructive —
-    // raw words are gone once stored. Tune word lists in shared/redact.ts.
-    const redactedUserMessages = session.userMessages.map(redactString);
-    const { transcript: redactedTranscript, droppedMessages } = capTranscript(
-      redactTree(session.rawMessages) as unknown[]
-    );
-
-    if (droppedMessages > 0) {
-      console.warn(
-        `  truncated transcript for ${filePath}: dropped ${droppedMessages} middle messages to fit the jsonb size limit`
+    return await sql.begin(async (tx) => {
+      const stored = await lockAggregates(tx, id);
+      if (rebuild) {
+        await tx`DELETE FROM transcript_chunks WHERE session_id = ${id}`;
+      }
+      const acc = new SessionAccumulator(
+        rebuild || !stored ? emptyAggregates() : stored
       );
-    }
 
-    // Build search text from the redacted user messages
-    const searchText = redactedUserMessages.join(' ');
+      let chunk: unknown[] = [];
+      let chunkBytes = 0;
+      let chunkStart = start;
+      let end = start;
 
-    // Upsert session
-    await sql`
-      INSERT INTO sessions (
-        id,
-        started_at,
-        ended_at,
-        git_branch,
-        cwd,
-        version,
-        hostname,
-        message_count,
-        input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
-        user_messages,
-        tools_used,
-        files_touched,
-        models_used,
-        model_tokens,
-        search_text,
-        transcript,
-        transcript_path,
-        transcript_hash,
-        synced_at
-      ) VALUES (
-        ${session.id},
-        ${session.startedAt},
-        ${session.endedAt},
-        ${session.gitBranch},
-        ${session.cwd},
-        ${session.version},
-        ${HOSTNAME},
-        ${session.messageCount},
-        ${session.inputTokens},
-        ${session.outputTokens},
-        ${session.cacheCreationTokens},
-        ${session.cacheReadTokens},
-        ${sql.json(redactedUserMessages)},
-        ${sql.json(session.toolsUsed)},
-        ${sql.json(session.filesFromToolCalls)},
-        ${sql.json(session.modelsUsed)},
-        ${sql.json(session.modelTokens)},
-        ${searchText},
-        ${sql.json(redactedTranscript)},
-        ${filePath},
-        ${hash},
-        NOW()
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        started_at = EXCLUDED.started_at,
-        ended_at = EXCLUDED.ended_at,
-        git_branch = EXCLUDED.git_branch,
-        cwd = EXCLUDED.cwd,
-        version = EXCLUDED.version,
-        hostname = EXCLUDED.hostname,
-        message_count = EXCLUDED.message_count,
-        input_tokens = EXCLUDED.input_tokens,
-        output_tokens = EXCLUDED.output_tokens,
-        cache_creation_tokens = EXCLUDED.cache_creation_tokens,
-        cache_read_tokens = EXCLUDED.cache_read_tokens,
-        user_messages = EXCLUDED.user_messages,
-        tools_used = EXCLUDED.tools_used,
-        files_touched = EXCLUDED.files_touched,
-        models_used = EXCLUDED.models_used,
-        model_tokens = EXCLUDED.model_tokens,
-        search_text = EXCLUDED.search_text,
-        transcript = EXCLUDED.transcript,
-        transcript_path = EXCLUDED.transcript_path,
-        transcript_hash = EXCLUDED.transcript_hash,
-        synced_at = NOW()
-    `;
+      const flush = async () => {
+        if (chunk.length > 0) {
+          await tx`
+            INSERT INTO transcript_chunks (session_id, start_offset, end_offset, lines)
+            VALUES (${id}, ${chunkStart}, ${end}, ${tx.json(chunk as postgres.JSONValue)})
+          `;
+        }
+        chunk = [];
+        chunkBytes = 0;
+        chunkStart = end;
+      };
 
-    return existingHash ? 'updated' : 'created';
+      for await (const { line, end: lineEnd } of readLines(file.path, start)) {
+        end = lineEnd;
+        if (isSkippedLine(line)) continue;
+        let parsed: { type?: string };
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue; // Skip malformed lines
+        }
+        // Scrub profanity before anything hits the DB. Intentionally
+        // destructive — raw words are gone once stored. Tune word lists in
+        // shared/redact.ts.
+        acc.add(parsed, redactString);
+        chunk.push(redactTree(parsed));
+        chunkBytes += line.length;
+        if (chunkBytes >= CHUNK_BYTES) await flush();
+      }
+      await flush();
+
+      if (!acc.hasConversation) throw new NoConversation();
+      const s = acc.result();
+
+      await tx`
+        INSERT INTO sessions (
+          id, started_at, ended_at, git_branch, cwd, version, hostname,
+          message_count, input_tokens, output_tokens,
+          cache_creation_tokens, cache_read_tokens,
+          user_messages, tools_used, files_touched, models_used, model_tokens,
+          search_text, transcript_path, source_size, source_offset, synced_at
+        ) VALUES (
+          ${id}, ${s.startedAt}, ${s.endedAt}, ${s.gitBranch}, ${s.cwd},
+          ${s.version}, ${HOSTNAME},
+          ${s.messageCount}, ${s.inputTokens}, ${s.outputTokens},
+          ${s.cacheCreationTokens}, ${s.cacheReadTokens},
+          ${tx.json(s.userMessages)}, ${tx.json(s.toolsUsed)},
+          ${tx.json(s.filesFromToolCalls)}, ${tx.json(s.modelsUsed)},
+          ${tx.json(s.modelTokens)},
+          ${s.userMessages.join(' ')}, ${file.path}, ${file.size}, ${end}, NOW()
+        )
+        ON CONFLICT (id) DO UPDATE SET
+          started_at = EXCLUDED.started_at,
+          ended_at = EXCLUDED.ended_at,
+          git_branch = EXCLUDED.git_branch,
+          cwd = EXCLUDED.cwd,
+          version = EXCLUDED.version,
+          hostname = EXCLUDED.hostname,
+          message_count = EXCLUDED.message_count,
+          input_tokens = EXCLUDED.input_tokens,
+          output_tokens = EXCLUDED.output_tokens,
+          cache_creation_tokens = EXCLUDED.cache_creation_tokens,
+          cache_read_tokens = EXCLUDED.cache_read_tokens,
+          user_messages = EXCLUDED.user_messages,
+          tools_used = EXCLUDED.tools_used,
+          files_touched = EXCLUDED.files_touched,
+          models_used = EXCLUDED.models_used,
+          model_tokens = EXCLUDED.model_tokens,
+          search_text = EXCLUDED.search_text,
+          transcript_path = EXCLUDED.transcript_path,
+          source_size = EXCLUDED.source_size,
+          source_offset = EXCLUDED.source_offset,
+          synced_at = NOW()
+      `;
+
+      if (!stored) return 'created';
+      return rebuild ? 'rebuilt' : 'appended';
+    });
   } catch (error) {
-    console.error(`Error syncing ${filePath}:`, error);
+    if (error instanceof NoConversation) return 'skipped';
+    console.error(`Error syncing ${file.path}:`, error);
     return 'error';
   }
 }
@@ -333,32 +317,24 @@ async function syncSession(
  * Main sync function
  */
 async function sync(baseDir: string, options: SyncOptions): Promise<SyncStats> {
-  const stats: SyncStats = {
-    created: 0,
-    updated: 0,
-    skipped: 0,
-    errors: 0,
-  };
+  const stats: SyncStats = { created: 0, appended: 0, rebuilt: 0, skipped: 0, error: 0 };
 
   console.log(`Syncing sessions from: ${baseDir}`);
   console.log(`Hostname: ${HOSTNAME}`);
 
-  // Get existing hashes for change detection
-  const existingHashes = await getExistingHashes();
-  console.log(`Found ${existingHashes.size} existing sessions in database`);
+  const checkpoints = await getCheckpoints();
+  console.log(`Found ${checkpoints.size} checkpointed sessions in database`);
 
-  // Find files to sync
   const files = findFilesToSync(baseDir, options);
-  console.log(`Found ${files.length} session files to process`);
+  console.log(`Found ${files.length} session files to check`);
 
-  // Process each file
-  for (const { path: filePath } of files) {
-    const result = await syncSession(filePath, existingHashes, options);
-    const key = result === 'error' ? 'errors' : result;
-    stats[key]++;
+  for (const file of files) {
+    const id = sessionIdFromPath(file.path);
+    const result = await syncSession(file, id ? checkpoints.get(id) : undefined, options);
+    stats[result]++;
 
     if (result !== 'skipped') {
-      console.log(`  ${result}: ${filePath}`);
+      console.log(`  ${result}: ${file.path}`);
     }
   }
 
@@ -369,7 +345,6 @@ async function sync(baseDir: string, options: SyncOptions): Promise<SyncStats> {
 async function main() {
   const { values } = parseArgs({
     options: {
-      all: { type: 'boolean', short: 'a' },
       days: { type: 'string', short: 'd' },
       force: { type: 'boolean', short: 'f' },
       limit: { type: 'string', short: 'l' },
@@ -386,10 +361,9 @@ Usage:
   bun run sync.ts [options]
 
 Options:
-  -a, --all              Sync all sessions (not just recent)
-  -d, --days <n>         Only sync last N days
-  -f, --force            Re-sync even if file unchanged
-  -l, --limit <n>        Max files to process
+  -d, --days <n>         Only check files changed in the last N days
+  -f, --force            Rebuild every session from the start of its file
+  -l, --limit <n>        Max files to check
   --dir <path>           Sessions directory
   -h, --help             Show this help
 
@@ -399,15 +373,13 @@ Environment:
 
 Examples:
   bun run sync.ts                    # Incremental sync
-  bun run sync.ts --all              # Full sync
   bun run sync.ts --days 7           # Last week only
-  bun run sync.ts --force            # Force re-sync
+  bun run sync.ts --force            # Rebuild everything
 `);
     process.exit(0);
   }
 
   const options: SyncOptions = {
-    all: values.all,
     days: values.days ? parseInt(values.days, 10) : undefined,
     force: values.force,
     limit: values.limit ? parseInt(values.limit, 10) : undefined,
@@ -419,10 +391,11 @@ Examples:
     const stats = await sync(baseDir, options);
 
     console.log('\nSync complete:');
-    console.log(`  Created: ${stats.created}`);
-    console.log(`  Updated: ${stats.updated}`);
-    console.log(`  Skipped: ${stats.skipped}`);
-    console.log(`  Errors:  ${stats.errors}`);
+    console.log(`  Created:  ${stats.created}`);
+    console.log(`  Appended: ${stats.appended}`);
+    console.log(`  Rebuilt:  ${stats.rebuilt}`);
+    console.log(`  Skipped:  ${stats.skipped}`);
+    console.log(`  Errors:   ${stats.error}`);
   } finally {
     await sql.end();
   }

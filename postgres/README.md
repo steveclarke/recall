@@ -24,19 +24,16 @@ bun run serve
 ## Sync Options
 
 ```bash
-# Incremental sync (new/changed files only)
+# Incremental sync: skips unchanged files, reads growing ones from their checkpoint
 bun run sync
 
-# Full sync (all sessions)
-bun run sync --all
-
-# Last 7 days only
+# Only check files changed in the last 7 days
 bun run sync --days 7
 
-# Force re-sync unchanged files
+# Rebuild every session from the start of its file
 bun run sync --force
 
-# Limit files processed
+# Check at most 100 files (newest first)
 bun run sync --limit 100
 ```
 
@@ -140,6 +137,12 @@ Add to crontab for automatic updates:
 */15 * * * * cd /path/to/postgres && DATABASE_URL="..." bun run sync >> /var/log/session-sync.log 2>&1
 ```
 
+Each session row keeps `source_size` and `source_offset`; the transcript is
+stored in `transcript_chunks`, one row per ~8 MB of source lines, appended as
+the session grows. An existing database moves to this layout with
+`migrations/004_incremental_sync.sql`; the first sync afterwards rebuilds each
+session whose JSONL still exists, once.
+
 ## Database Management
 
 ```bash
@@ -169,7 +172,7 @@ bun run db:up
 ## Docker Compose
 
 The included `docker-compose.yml`:
-- Uses PostgreSQL 16 Alpine
+- Uses PostgreSQL 18 Alpine
 - Exposes on port 5433 (avoids conflicts with existing Postgres)
 - Auto-runs schema on first start
 - Persists data in a named volume

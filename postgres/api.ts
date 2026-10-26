@@ -122,12 +122,12 @@ app.get('/sessions', async (c) => {
     transcript_path
   `;
 
-  if (search) {
-    const tsQuery = search
-      .split(/\s+/)
-      .filter(Boolean)
-      .map((term) => `${term}:*`)
-      .join(' & ');
+  // Split on anything that is not a letter or digit: tsquery syntax
+  // characters in a search ("(", "|", "!", ":") would otherwise make
+  // to_tsquery reject the whole query.
+  const terms = (search ?? '').split(/[^\p{L}\p{N}_]+/u).filter(Boolean);
+  if (terms.length > 0) {
+    const tsQuery = terms.map((term) => `${term}:*`).join(' & ');
 
     conditions.push(`search_vector @@ to_tsquery('english', $${paramIndex++})`);
     params.push(tsQuery);
@@ -235,104 +235,69 @@ app.get('/sessions/stats', async (c) => {
  */
 app.get('/sessions/:id', async (c) => {
   const { id } = c.req.param();
-  const { with_transcript } = c.req.query();
+  const withTranscript = c.req.query('with_transcript') === 'true';
 
   try {
-    const withTranscript = with_transcript === 'true';
-
-    const rows = withTranscript
-      ? await sql`
-          SELECT
-            id,
-            started_at,
-            ended_at,
-            git_branch,
-            cwd,
-            version,
-            hostname,
-            message_count,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-            tools_used,
-            files_touched,
-            user_messages,
-            models_used,
-            model_tokens,
-            summary,
-            category,
-            transcript_path,
-            transcript
-          FROM sessions
-          WHERE id = ${id}
-        `
-      : await sql`
-          SELECT
-            id,
-            started_at,
-            ended_at,
-            git_branch,
-            cwd,
-            version,
-            hostname,
-            message_count,
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-            tools_used,
-            files_touched,
-            user_messages,
-            models_used,
-            model_tokens,
-            summary,
-            category,
-            transcript_path
-          FROM sessions
-          WHERE id = ${id}
-        `;
+    const rows = await sql`
+      SELECT
+        id,
+        started_at,
+        ended_at,
+        git_branch,
+        cwd,
+        version,
+        hostname,
+        message_count,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        tools_used,
+        files_touched,
+        user_messages,
+        models_used,
+        model_tokens,
+        summary,
+        category,
+        transcript_path
+      FROM sessions
+      WHERE id = ${id}
+    `;
 
     if (rows.length === 0) {
       return c.json({ success: false, error: 'Session not found' }, 404);
     }
 
     const session = rows[0];
-
-    // Optionally attach transcript. Prefer the archived JSONB column;
-    // fall back to reading the local JSONL file for pre-migration-003
-    // rows whose transcript hasn't been backfilled yet.
-    if (withTranscript) {
-      if (Array.isArray(session.transcript)) {
-        (session as Record<string, unknown>).messages = session.transcript;
-      } else if (session.transcript_path) {
-        try {
-          const { readFileSync } = await import('fs');
-          const content = readFileSync(session.transcript_path, 'utf-8');
-          const messages = content
-            .trim()
-            .split('\n')
-            .filter(Boolean)
-            .map((line) => {
-              try {
-                return JSON.parse(line);
-              } catch {
-                return null;
-              }
-            })
-            .filter(Boolean);
-          (session as Record<string, unknown>).messages = messages;
-        } catch {
-          // Transcript file not accessible (machine retired, file rotated)
-        }
-      }
-      // Don't leak the raw column alongside the normalized messages field.
-      delete (session as Record<string, unknown>).transcript;
+    if (!withTranscript) {
+      return c.json({ success: true, data: session });
     }
 
-    return c.json({
-      success: true,
-      data: session,
+    // The archived transcript can run to hundreds of megabytes, so it is
+    // streamed into the response one stored chunk at a time instead of being
+    // assembled in memory: the session fields, then `messages` as the
+    // concatenation of every chunk's lines in file order.
+    const head = JSON.stringify({ success: true, data: session });
+    const chunks = sql`
+      SELECT lines::text AS lines FROM transcript_chunks
+      WHERE session_id = ${id}
+      ORDER BY start_offset
+    `.cursor(1);
+
+    async function* body() {
+      yield head.slice(0, -2) + ',"messages":[';
+      let first = true;
+      for await (const [row] of chunks) {
+        const inner = row.lines.slice(1, -1); // drop the array brackets
+        if (!inner) continue;
+        yield (first ? '' : ',') + inner;
+        first = false;
+      }
+      yield ']}}';
+    }
+
+    return new Response(body(), {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
     });
   } catch (error) {
     console.error('Get session error:', error);

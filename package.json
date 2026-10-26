@@ -6,7 +6,8 @@
   "scripts": {
     "search": "bun run file-based/search.ts",
     "sync": "bun run postgres/sync.ts",
-    "serve": "bun run postgres/api.ts"
+    "serve": "bun run postgres/api.ts",
+    "test": "bun test test/"
   },
   "keywords": [
     "claude",

@@ -54,6 +54,17 @@ export interface TokenUsage {
 }
 
 /**
+ * Running totals for one session, as stored in its database row. The sync
+ * seeds a SessionAccumulator with these and folds in only new lines.
+ * Timestamps stay ISO strings here, exactly as the JSONL writes them.
+ */
+export interface SessionAggregates
+  extends Omit<ParsedSession, 'id' | 'startedAt' | 'endedAt'> {
+  startedAt: string | null;
+  endedAt: string | null;
+}
+
+/**
  * Parsed session data extracted from JSONL
  */
 export interface ParsedSession {
@@ -84,11 +95,6 @@ export interface ParsedSession {
     cacheCreation: number;
     cacheRead: number;
   }>;
-
-  // Full archival transcript — every successfully-parsed JSONL line as-is.
-  // Stored in Postgres as JSONB so the DB survives Claude Code's local
-  // cleanup of `~/.claude/projects/*.jsonl` files.
-  rawMessages: unknown[];
 }
 
 /**

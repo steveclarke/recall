@@ -66,32 +66,56 @@ const censor = new TextCensor();
  */
 export function redactString(input: string): string {
   if (!input) return input;
-  const sanitized = input.includes('\u0000') ? input.replace(/\u0000/g, '') : input;
+  const sanitized = stripNul(input);
   const matches = matcher.getAllMatches(sanitized);
   if (matches.length === 0) return sanitized;
   return censor.applyTo(sanitized, matches);
 }
 
 /**
- * Walk a parsed-JSON tree and redact every string leaf in place.
+ * Fields that hold identifiers, timestamps, signatures or encoded bytes,
+ * never words. The English preset reads digits as letters ("455" as "ass",
+ * "fCk" as a swear word), so scrubbing these corrupted UUIDs, timestamps
+ * and the tool_use ids that pair each tool call with its result, and broke
+ * base64 images. Skipping them is also most of redaction's cost: base64
+ * image data alone was over a third of it.
+ */
+const MACHINE_KEYS = new Set([
+  'uuid', 'parentUuid', 'leafUuid', 'sessionId', 'messageId', 'promptId',
+  'requestId', 'agentId', 'id', 'tool_use_id', 'toolUseID',
+  'sourceToolUseID', 'timestamp', 'signature', 'data', 'base64',
+  'media_type', 'type', 'cwd', 'realParentDir', 'gitBranch', 'version',
+  'model', 'slug', 'userType', 'stop_reason', 'entrypoint',
+]);
+
+/** A long run with no whitespace is an encoded blob or a hash, not prose. */
+const BLOB = /^\S{200,}$/;
+
+function stripNul(input: string): string {
+  return input.includes('\u0000') ? input.replace(/\u0000/g, '') : input;
+}
+
+/**
+ * Walk a parsed-JSON tree and redact every string leaf that holds words.
  * Returns a new tree — does NOT mutate the input.
  *
- * Used for the `transcript` JSONB column where we store the full
- * parsed-JSONL array. Scrubs user messages, assistant text blocks,
- * tool_result contents, and any other string field — we prefer
- * over-scrubbing to under-scrubbing here.
+ * Used for the archived transcript. Scrubs user messages, assistant text
+ * blocks, tool_result contents, and any other string field — we prefer
+ * over-scrubbing to under-scrubbing here — except the machine fields above,
+ * which only have NUL bytes stripped.
  */
-export function redactTree(node: unknown): unknown {
+export function redactTree(node: unknown, key?: string): unknown {
   if (typeof node === 'string') {
+    if ((key && MACHINE_KEYS.has(key)) || BLOB.test(node)) return stripNul(node);
     return redactString(node);
   }
   if (Array.isArray(node)) {
-    return node.map(redactTree);
+    return node.map((v) => redactTree(v, key));
   }
   if (node && typeof node === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      out[k] = redactTree(v);
+      out[k] = redactTree(v, k);
     }
     return out;
   }

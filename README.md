@@ -35,6 +35,12 @@ Then schedule `bun run sync.ts` every 15 minutes on each machine you use
 Claude Code from (launchd on macOS, systemd user timer on Linux). New
 sessions show up in the archive within the interval.
 
+The sync is incremental, like a log shipper: each session row records how
+many bytes of its JSONL have been read, unchanged files are skipped on a
+stat alone, and a growing file is read only from where the last run
+stopped. A run with nothing new takes under a second and about 50 MB of
+memory; memory stays bounded however large a transcript grows.
+
 ## Quick start — file-based
 
 ```bash
@@ -76,7 +82,7 @@ Forked from [`alexknowshtml/kuato`](https://github.com/alexknowshtml/kuato)
 (MIT) as of early 2026-04. The core design — user-messages-as-signal,
 weighted tsvector, file-based + Postgres variants — is Alex's. Renamed
 and extended in this fork with hostname-stamped rows, full transcript
-archival in JSONB, profanity redaction at sync time, daily pg_dump
+archival in Postgres, incremental sync, profanity redaction at sync time, daily pg_dump
 backups, and Postgres 18.
 
 ## License

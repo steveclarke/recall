@@ -1,9 +1,6 @@
 -- Claude Code Session Memory - PostgreSQL Schema
 -- Run this to set up the database
 
--- Enable required extensions
-CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- For fuzzy text matching
-
 -- Main sessions table
 CREATE TABLE IF NOT EXISTS sessions (
     id VARCHAR(36) PRIMARY KEY,  -- Claude Code session UUID
@@ -37,13 +34,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     search_text TEXT,
     search_vector TSVECTOR,
 
-    -- File reference
+    -- Source file and sync checkpoint. source_size is the file size at the
+    -- last read (equal size means unchanged); source_offset is the bytes
+    -- consumed, up to the last complete line.
     transcript_path TEXT,
-    transcript_hash VARCHAR(32),  -- MD5 for change detection
-
-    -- Full archival transcript (every parsed JSONL line). Survives local
-    -- JSONL cleanup. Nullable for rows predating migration 003.
-    transcript JSONB,
+    source_size BIGINT,
+    source_offset BIGINT,
 
     -- Optional classification (if you want to add LLM summaries later)
     summary TEXT,
@@ -56,19 +52,27 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_sessions_ended_at ON sessions(ended_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_sessions_category ON sessions(category);
 CREATE INDEX IF NOT EXISTS idx_sessions_hostname ON sessions(hostname);
 
 -- Full-text search index (GIN for performance)
 CREATE INDEX IF NOT EXISTS idx_sessions_search_vector ON sessions USING GIN(search_vector);
 
--- Trigram index for fuzzy matching on summary
-CREATE INDEX IF NOT EXISTS idx_sessions_summary_trgm ON sessions USING GIN(summary gin_trgm_ops);
-
--- JSONB indexes for filtering
+-- JSONB index for the tools filter (tools_used ?| ...)
 CREATE INDEX IF NOT EXISTS idx_sessions_tools_used ON sessions USING GIN(tools_used);
-CREATE INDEX IF NOT EXISTS idx_sessions_files_touched ON sessions USING GIN(files_touched);
+
+-- Full archival transcript: every JSONL line except api-request copies,
+-- redacted, in rows of about 8 MB of source bytes ordered by start_offset.
+-- Survives local JSONL cleanup. New lines are appended as new rows, so a
+-- growing session never rewrites what is already stored. end_offset is NULL
+-- for rows moved from the old single-value column by migration 004.
+CREATE TABLE IF NOT EXISTS transcript_chunks (
+    session_id VARCHAR(36) NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+    start_offset BIGINT NOT NULL,
+    end_offset BIGINT,
+    lines JSONB COMPRESSION lz4 NOT NULL,
+    PRIMARY KEY (session_id, start_offset)
+);
 
 -- Function to update search vector
 CREATE OR REPLACE FUNCTION update_session_search_vector()
