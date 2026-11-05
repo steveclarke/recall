@@ -18,12 +18,12 @@ Production migration, import, deployment and restore remain untested and unperfo
 - An independent source-only reviewer checks `940fb48` against `604ae0b` after Steve authorizes the no-subagents exception. The reviewer does not read private archives or execute code. Its first verdict is FIX.
 - The parent reproduces undated attachment-only entry loss, JSON ordering errors through a DST rollback, and HTML edge-whitespace loss with synthetic fixtures. The fixes reject incomplete/unsupported HTML, preserve authored spaces and newlines, and use exact JSON instants for ordering, pages and context. HTML conversation retrieval follows the original source order.
 - Private Facebook routes are excluded from the existing session API's wildcard browser CORS policy. The original session policy keeps its prior behavior.
-- The expanded parser/import/API suite passes all 18 tests on Bun 1.4.4 and PostgreSQL 18. It also passes on the deployed runtime line, Bun 1.3.14, in a read-only, resource-limited container with no external network and a disposable synthetic-only database.
-- The corrected parser again reads all 696 conversations and 143,853 entries from the real HTML snapshot. The corrected importer succeeds in a disposable Studio database; no operational Recall database is changed.
+- The expanded parser/import/API suite passes all 18 tests on Bun 1.4.4 and PostgreSQL 18. The final reviewed code passes 73 assertions, including authored edge br elements. It also passes on the deployed runtime line, Bun 1.3.14, in a read-only, resource-limited container with no external network and a disposable synthetic-only database.
+- The corrected parser again reads all 696 conversations and 143,853 entries from the real HTML snapshot. The corrected importer succeeds in a disposable Studio database. Loopback HTTP reproduces the counts, a known direct thread, original final text, search context and absence of wildcard CORS. No operational Recall database is changed.
 
 ## Review and release
 
-- The same independent reviewer rechecks the corrected head before release approval.
+- The same independent reviewer returns source-only PASS on corrected implementation head `2c15e19df90f2a4fff27e86b740a5500a678104e`; the report is saved in `docs/facebook-review.md`. It performs no runtime checks and accesses no private data.
 - API route names remain proposed until approval for release.
 - Original source zips, unpacked exports and private proof files stay outside Git.
 - The disposable API and database are removed after verification; a live Recall import is a separate approved step.

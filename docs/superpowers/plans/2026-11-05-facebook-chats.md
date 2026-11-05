@@ -59,4 +59,4 @@
 - [x] Import the real archive into disposable local PostgreSQL; read back counts, known direct threads, search results and a repeated import.
 - [x] Document setup, migration, dry run, local proof, snapshot limitations and the live import approval boundary.
 - [x] Run all touched checks and a Claude route regression probe.
-- [ ] Complete independent review and commit the reviewable branch.
+- [x] Complete independent review and commit the reviewable branch.
