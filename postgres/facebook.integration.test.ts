@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import postgres, { type Sql } from 'postgres';
 import { facebookRoutes } from './facebook-api';
 import { importFacebookArchive, migrateFacebook } from './facebook-import';
-import { readFacebookArchive, type FacebookArchive } from './facebook-archive';
+import { repairFacebookLocalTimes } from './facebook-repair-local-time';
+import { hash, readFacebookArchive, type FacebookArchive } from './facebook-archive';
 
 const url = process.env.FACEBOOK_TEST_DATABASE_URL;
 const suite = url ? describe : describe.skip;
@@ -77,6 +78,34 @@ suite('Facebook PostgreSQL import and search', () => {
     const previous = await (await app.request(`/messages?export=${older.id}&search=reconciliation`)).json();
     expect(previous.export_id).toBe(older.id);
     expect(previous.count).toBe(1);
+  });
+  test('preserves source wall times with non-UTC client and database timezones', async () => {
+    const archive = structuredClone(newest);
+    archive.id = hash(newest.id + '-timezone-transport'); ids.add(archive.id);
+    archive.exportDate = '2096-01-01';
+    const conversation = archive.conversations[0];
+    conversation.id = hash(archive.id + '-conversation');
+    const source = conversation.messages[0];
+    conversation.messages = [
+      { ...source, id: hash(archive.id + '-summer'), content: 'summer', sourceOrder: 0, precision: 'millisecond', sentAt: '2012-06-20T21:00:59.085Z', sentLocal: '2012-06-20T18:30:59.085' },
+      { ...source, id: hash(archive.id + '-winter'), content: 'winter', sourceOrder: 1, sentAt: '2014-12-19T03:29:00Z', sentLocal: '2014-12-18T23:59:00' },
+      { ...source, id: hash(archive.id + '-fold'), content: 'fold', sourceOrder: 2, sentAt: null, sentLocal: '2020-11-01T01:30:00' },
+    ];
+    await sql`SET TIME ZONE 'America/Los_Angeles'`;
+    try {
+      await importFacebookArchive(sql, archive);
+      const rows = await sql`SELECT content, sent_local::text AS local, sent_at FROM facebook_messages WHERE conversation_id = ${conversation.id} ORDER BY source_order`;
+      expect(rows.map(m => m.local)).toEqual(['2012-06-20 18:30:59.085', '2014-12-18 23:59:00', '2020-11-01 01:30:00']);
+      expect(rows[0].sent_at.toISOString()).toBe('2012-06-20T21:00:59.085Z');
+      expect(rows[2].sent_at).toBeNull();
+      const sameDate = await (await app.request(`/messages?export=${archive.id}&since=2014-12-18&until=2014-12-18`)).json();
+      expect(sameDate.data.map((m: any) => m.content)).toEqual(['winter']);
+      const followingDate = await (await app.request(`/messages?export=${archive.id}&since=2014-12-19&until=2014-12-19`)).json();
+      expect(followingDate.count).toBe(0);
+    } finally {
+      await sql`DELETE FROM facebook_messages WHERE id = ${hash(archive.id + '-fold')}`;
+      await sql`SET TIME ZONE 'UTC'`;
+    }
   });
   test('orders JSON instants through DST rollback in pages, context and search', async () => {
     const fixture = join(root, 'dst');
@@ -156,5 +185,42 @@ suite('Facebook PostgreSQL import and search', () => {
     expect(facebook.headers.get('access-control-allow-origin')).toBeNull();
     const sessions = await api.fetch(new Request('http://localhost/sessions?limit=1', { headers }));
     expect(sessions.headers.get('access-control-allow-origin')).toBe('*');
+  });
+  test('repairs only local times, defaults to dry run and is safe to repeat', async () => {
+    const cid = newest.conversations[0].id;
+    await sql`UPDATE facebook_messages SET sent_local = sent_at AT TIME ZONE 'UTC' WHERE conversation_id = ${cid}`;
+    const snapshot = () => sql`SELECT id, to_jsonb(m) - 'sent_local' AS preserved, sent_local::text AS local
+      FROM facebook_messages m WHERE conversation_id = ${cid} ORDER BY id`;
+    const before = await snapshot();
+    const dry = await repairFacebookLocalTimes(sql);
+    expect(dry.status).toBe('dry_run');
+    expect(dry.mismatches_before).toBe(5);
+    expect(dry.corrected).toBe(0);
+    expect(await snapshot()).toEqual(before);
+    const repaired = await repairFacebookLocalTimes(sql, true);
+    expect(repaired.corrected).toBe(5);
+    expect(repaired.remaining_mismatches).toBe(0);
+    const after = await snapshot();
+    expect(after.map(m => m.preserved)).toEqual(before.map(m => m.preserved));
+    const expected = newest.conversations[0].messages.map(m => m.sentLocal.replace('T', ' ')).sort();
+    expect(after.map(m => m.local).sort()).toEqual(expected);
+    expect((await repairFacebookLocalTimes(sql, true)).corrected).toBe(0);
+  });
+  test('refuses an apply with unresolved instants before changing any resolved row', async () => {
+    const a = newest.conversations[0].messages[0].id;
+    const b = older.conversations[0].messages[0].id;
+    const [saved] = await sql`SELECT sent_at, sent_local::text AS local FROM facebook_messages WHERE id = ${b}`;
+    try {
+      await sql`UPDATE facebook_messages SET sent_at = NULL WHERE id = ${b}`;
+      await sql`UPDATE facebook_messages SET sent_local = sent_local + INTERVAL '1 hour' WHERE id = ${a}`;
+      const [before] = await sql`SELECT sent_local::text AS local FROM facebook_messages WHERE id = ${a}`;
+      expect((await repairFacebookLocalTimes(sql)).unresolved).toBe(1);
+      await expect(repairFacebookLocalTimes(sql, true)).rejects.toThrow('Unresolved');
+      const [after] = await sql`SELECT sent_local::text AS local FROM facebook_messages WHERE id = ${a}`;
+      expect(after.local).toBe(before.local);
+    } finally {
+      await sql`UPDATE facebook_messages SET sent_at = ${saved.sent_at}, sent_local = ${saved.local}::text::timestamp WHERE id = ${b}`;
+      await sql`UPDATE facebook_messages SET sent_local = sent_local - INTERVAL '1 hour' WHERE id = ${a}`;
+    }
   });
 });
