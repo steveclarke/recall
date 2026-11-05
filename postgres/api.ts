@@ -18,6 +18,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import postgres from 'postgres';
+import { facebookRoutes } from './facebook-api';
 
 // Configuration
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://localhost/claude_sessions';
@@ -31,6 +32,7 @@ const app = new Hono();
 
 // Enable CORS for local development
 app.use('*', cors());
+app.route('/facebook', facebookRoutes(sql));
 
 /**
  * Search sessions

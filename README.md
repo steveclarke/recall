@@ -3,6 +3,9 @@
 Durable, cross-machine archive of every Claude Code session, with a small
 HTTP API for searching your history and recalling where you left off.
 
+Facebook archive import and search support is available under `postgres/`; see
+[`postgres/FACEBOOK.md`](postgres/FACEBOOK.md) for snapshot imports, search and verification.
+
 ## What it does
 
 Claude Code stores its transcripts as JSONL files in `~/.claude/projects/`
