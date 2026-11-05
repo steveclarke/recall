@@ -7,9 +7,13 @@
     "db:down": "docker-compose down",
     "db:logs": "docker-compose logs -f",
     "sync": "bun run sync.ts",
-    "serve": "bun run api.ts"
+    "serve": "bun run api.ts",
+    "facebook:import": "bun run facebook-import.ts",
+    "test:facebook": "bun test facebook.test.ts facebook.integration.test.ts"
   },
   "dependencies": {
+    "@js-temporal/polyfill": "^0.5.1",
+    "entities": "^9.0.0",
     "hono": "^4.6.0",
     "postgres": "^3.4.0"
   }

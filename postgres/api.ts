@@ -18,6 +18,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import postgres from 'postgres';
+import { facebookRoutes } from './facebook-api';
 
 // Configuration
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://localhost/claude_sessions';
@@ -30,7 +31,15 @@ const sql = postgres(DATABASE_URL);
 const app = new Hono();
 
 // Enable CORS for local development
-app.use('*', cors());
+const sessionCors = cors();
+app.use('*', (c, next) => {
+  // Private Facebook messages are queried by agents/CLI clients, not arbitrary
+  // browser origins. Preserve the existing session API's CORS behavior only.
+  return c.req.path === '/facebook' || c.req.path.startsWith('/facebook/')
+    ? next()
+    : sessionCors(c, next);
+});
+app.route('/facebook', facebookRoutes(sql));
 
 /**
  * Search sessions
