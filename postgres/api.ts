@@ -31,7 +31,14 @@ const sql = postgres(DATABASE_URL);
 const app = new Hono();
 
 // Enable CORS for local development
-app.use('*', cors());
+const sessionCors = cors();
+app.use('*', (c, next) => {
+  // Private Facebook messages are queried by agents/CLI clients, not arbitrary
+  // browser origins. Preserve the existing session API's CORS behavior only.
+  return c.req.path === '/facebook' || c.req.path.startsWith('/facebook/')
+    ? next()
+    : sessionCors(c, next);
+});
 app.route('/facebook', facebookRoutes(sql));
 
 /**

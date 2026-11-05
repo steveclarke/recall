@@ -60,7 +60,9 @@ export function facebookRoutes(sql: Sql) {
     const limit = number(c, 'limit', 20, 100, 1), offset = number(c, 'offset', 0, 1_000_000);
     const rows = await sql`SELECT t.id, t.title, t.source_thread, e.timezone,
       array(SELECT name FROM facebook_participants p WHERE p.conversation_id = t.id ORDER BY name) AS participants,
-      count(m.id)::int AS message_count, min(m.sent_local)::text AS first_message, max(m.sent_local)::text AS last_message
+      count(m.id)::int AS message_count,
+      (array_agg(m.sent_local ORDER BY CASE WHEN e.format = 'json' THEN m.sent_at END ASC NULLS LAST, m.source_order DESC))[1]::text AS first_message,
+      (array_agg(m.sent_local ORDER BY CASE WHEN e.format = 'json' THEN m.sent_at END DESC NULLS LAST, m.source_order ASC))[1]::text AS last_message
       FROM facebook_conversations t JOIN facebook_exports e ON e.id = t.export_id
       LEFT JOIN facebook_messages m ON m.conversation_id = t.id
       WHERE t.export_id = ${id}
@@ -68,7 +70,7 @@ export function facebookRoutes(sql: Sql) {
       AND ${since || until ? sql`EXISTS (SELECT 1 FROM facebook_messages d WHERE d.conversation_id = t.id
         AND ${since ? sql`d.sent_local >= ${since}::date` : sql`true`}
         AND ${until ? sql`d.sent_local < ${until}::date + INTERVAL '1 day'` : sql`true`})` : sql`true`}
-      GROUP BY t.id, e.timezone ORDER BY max(m.sent_local) DESC NULLS LAST, t.id LIMIT ${limit} OFFSET ${offset}`;
+      GROUP BY t.id, e.timezone, e.format ORDER BY max(m.sent_at) DESC NULLS LAST, max(m.sent_local) DESC NULLS LAST, t.id LIMIT ${limit} OFFSET ${offset}`;
     return c.json({ success: true, export_id: id, count: rows.length, data: rows });
   });
 
@@ -84,7 +86,8 @@ export function facebookRoutes(sql: Sql) {
       AND ${search ? sql`m.search_vector @@ websearch_to_tsquery('simple', ${search})` : sql`true`}
       AND ${since ? sql`m.sent_local >= ${since}::date` : sql`true`}
       AND ${until ? sql`m.sent_local < ${until}::date + INTERVAL '1 day'` : sql`true`}
-      ORDER BY m.sent_local DESC, t.id, m.source_order ASC LIMIT ${limit} OFFSET ${offset}`;
+      ORDER BY CASE WHEN e.format = 'json' THEN m.sent_at END DESC NULLS LAST,
+        m.sent_local DESC, t.id, m.source_order ASC LIMIT ${limit} OFFSET ${offset}`;
     return c.json({ success: true, export_id: id, count: rows.length, data: rows });
   });
 
@@ -106,15 +109,20 @@ export function facebookRoutes(sql: Sql) {
     }
     const limit = number(c, 'limit', 50, 100, 1), offset = number(c, 'offset', 0, 1_000_000);
     const before = number(c, 'before', 5, 49), after = number(c, 'after', 5, 49);
-    const conversations = await sql`SELECT t.id, t.title, t.export_id, e.timezone FROM facebook_conversations t
+    const conversations = await sql`SELECT t.id, t.title, t.export_id, e.timezone, e.format FROM facebook_conversations t
       JOIN facebook_exports e ON e.id = t.export_id WHERE t.id = ${id}`;
     if (!conversations.length) throw new HTTPException(404, { message: 'Conversation not found' });
+    // JSON has exact instants; HTML's export order remains authoritative through
+    // unresolved DST wall times. Source order is newest-first across numbered files.
+    const chronology = conversations[0].format === 'json'
+      ? sql`m.sent_at ASC NULLS LAST, m.source_order DESC`
+      : sql`m.source_order DESC`;
     let rows;
     if (around) {
       const found = await sql`SELECT id FROM facebook_messages WHERE id = ${around} AND conversation_id = ${id}`;
       if (!found.length) throw new HTTPException(404, { message: 'Message not found in this conversation' });
       rows = await sql`WITH ordered AS (
-        SELECT ${fields}, row_number() OVER (ORDER BY m.sent_local, m.source_order DESC) AS position
+        SELECT ${fields}, row_number() OVER (ORDER BY ${chronology}) AS position
         FROM facebook_messages m WHERE m.conversation_id = ${id}
       ), anchor AS (SELECT position FROM ordered WHERE id = ${around})
       SELECT ordered.* FROM ordered, anchor
@@ -122,7 +130,7 @@ export function facebookRoutes(sql: Sql) {
       ORDER BY ordered.position`;
     } else {
       rows = await sql`SELECT ${fields} FROM facebook_messages m WHERE m.conversation_id = ${id}
-        ORDER BY m.sent_local, m.source_order DESC LIMIT ${limit} OFFSET ${offset}`;
+        ORDER BY ${chronology} LIMIT ${limit} OFFSET ${offset}`;
     }
     return c.json({ success: true, conversation: conversations[0], count: rows.length, data: rows });
   });

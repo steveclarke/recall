@@ -66,7 +66,14 @@ export function htmlDate(value: string, timezone: string) {
   return { sentAt, sentLocal: wall.toString(), precision: 'minute' as const };
 }
 
-interface HtmlCard { sender: string; body: string; date: string; links: unknown[] }
+interface BodyPart { text: string; structural: boolean }
+interface HtmlCard { sender: string; body: BodyPart[]; date: string; links: unknown[]; isMessage: boolean }
+function originalBody(parts: BodyPart[]) {
+  let start = 0, end = parts.length;
+  while (start < end && parts[start].structural) start++;
+  while (end > start && parts[end - 1].structural) end--;
+  return decodeHTML(parts.slice(start, end).map(part => part.text).join(''));
+}
 export async function parseFacebookHtml(text: string, timezone: string) {
   let title = '', participantText = '';
   let current: HtmlCard | null = null;
@@ -74,31 +81,35 @@ export async function parseFacebookHtml(text: string, timezone: string) {
   const rewriter = new HTMLRewriter()
     .on('title', { text(chunk) { title += chunk.text; } })
     .on('div.pam', { element(e) {
-      const card: HtmlCard = { sender: '', body: '', date: '', links: [] };
+      const card: HtmlCard = { sender: '', body: [], date: '', links: [], isMessage: false };
       current = card;
       e.onEndTag(() => { cards.push(card); current = null; });
     } })
     .on('div.pam div._2lel', { text(chunk) { if (current) current.sender += chunk.text; } })
-    .on('div.pam div._2let', { text(chunk) { if (current) current.body += chunk.text; } })
+    .on('div.pam div._2let', {
+      element() { if (current) current.isMessage = true; },
+      text(chunk) { if (current && chunk.text) current.body.push({ text: chunk.text, structural: false }); },
+    })
     .on('div.pam div._3-94', { text(chunk) { if (current) current.date += chunk.text; } })
     .on('div.pam div._2lek:not(._2lel)', { text(chunk) { participantText += chunk.text; } })
     .on('div._2let div, div._2let p, div._2let br, div._2let li', { element(e) {
-      if (current) current.body += '\n';
-      if (e.tagName !== 'br') e.onEndTag(() => { if (current) current.body += '\n'; });
+      if (current) current.body.push({ text: '\n', structural: e.tagName !== 'br' });
+      if (e.tagName !== 'br') e.onEndTag(() => { if (current) current.body.push({ text: '\n', structural: true }); });
     } })
     .on('div._2let a, div._2let img, div._2let video, div._2let audio, div._2let source', { element(e) {
       const uri = e.getAttribute('href') ?? e.getAttribute('src');
       if (current && uri) current.links.push({ tag: e.tagName, uri: decodeHTML(uri), alt: decodeHTML(e.getAttribute('alt') ?? '') });
     } });
   await rewriter.transform(new Response(text)).text();
+  if (!cards.length) throw new Error('No supported Facebook message cards');
   const messages = cards.filter(c => c.date.trim()).map(c => ({
     sender: decodeHTML(c.sender).trim() || null,
-    content: decodeHTML(c.body).trim(),
+    content: originalBody(c.body),
     ...htmlDate(decodeHTML(c.date).trim(), timezone),
     attachments: c.links,
     payload: { date: decodeHTML(c.date).trim() },
   }));
-  if (cards.some(c => !c.date.trim() && (c.sender.trim() || c.body.trim()))) {
+  if (cards.some(c => !c.date.trim() && (c.isMessage || c.sender.trim() || c.links.length))) {
     throw new Error('A message card has no date');
   }
   const participants = new Set(messages.flatMap(m => m.sender ? [m.sender] : []));

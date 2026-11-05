@@ -30,7 +30,7 @@ The file manifest, format, export date and time zone identify an immutable snaps
 
 ## Search API
 
-The existing Recall API gains these proposed routes after deployment:
+The existing Recall API gains these proposed routes after deployment. These private routes do not opt into the existing session API's wildcard browser CORS policy; agents and CLI clients can query them over the approved private network:
 
 | Route | Result |
 | --- | --- |
@@ -54,7 +54,7 @@ Conversations and messages accept inclusive local calendar dates through `since=
 /facebook/conversations/CONVERSATION_ID/messages?around=MESSAGE_ID&before=5&after=5
 ```
 
-An `around` query returns up to 49 messages before and after the match, plus the match itself. Without `around`, offset pagination applies. Equal timestamps retain the source's reverse-chronological ordering, reversed for chronological retrieval. Source file and order identify each original entry; the export manifest records file hashes and the source directory.
+An `around` query returns up to 49 messages before and after the match, plus the match itself. Without `around`, offset pagination applies. JSON conversation pages and context use exact UTC instants, with source order breaking equal timestamps. HTML conversation pages and context reverse the export's newest-first source order, including during ambiguous DST wall times. Message search orders JSON by exact instant and HTML by local wall time; the latter cannot establish an exact cross-conversation order during a DST fold. Source file and order identify each original entry; the export manifest records file hashes and the source directory.
 
 ## Fidelity and scope
 

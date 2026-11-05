@@ -78,6 +78,36 @@ suite('Facebook PostgreSQL import and search', () => {
     expect(previous.export_id).toBe(older.id);
     expect(previous.count).toBe(1);
   });
+  test('orders JSON instants through DST rollback in pages, context and search', async () => {
+    const fixture = join(root, 'dst');
+    const dir = join(fixture, 'messages/inbox/example');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'message_1.json'), JSON.stringify({ title: 'DST example', participants: [{ name: 'Example' }], messages: [
+      { sender_name: 'Example', content: 'later', timestamp_ms: Date.parse('2020-11-01T04:45:00Z') },
+      { sender_name: 'Example', content: 'earlier', timestamp_ms: Date.parse('2020-11-01T04:15:00Z') },
+    ] }));
+    const archive = await readFacebookArchive(fixture, 'json', '2097-01-01', 'America/St_Johns');
+    ids.add(archive.id);
+    try {
+      await importFacebookArchive(sql, archive);
+      const conversation = archive.conversations[0];
+      const path = `/conversations/${conversation.id}/messages`;
+      const first = await (await app.request(path + '?limit=1')).json();
+      const second = await (await app.request(path + '?limit=1&offset=1')).json();
+      expect(first.data[0].content).toBe('earlier');
+      expect(second.data[0].content).toBe('later');
+      const context = await (await app.request(path + '?around=' + conversation.messages[0].id)).json();
+      expect(context.data.map((m: any) => m.content)).toEqual(['earlier', 'later']);
+      const search = await (await app.request(`/messages?export=${archive.id}`)).json();
+      expect(search.data.map((m: any) => m.content)).toEqual(['later', 'earlier']);
+      const summary = await (await app.request(`/conversations?export=${archive.id}`)).json();
+      expect(summary.data[0].first_message).toBe('2020-11-01 01:45:00');
+      expect(summary.data[0].last_message).toBe('2020-11-01 01:15:00');
+    } finally {
+      await unlink(join(dir, 'message_1.json'));
+      for (const p of ['messages/inbox/example', 'messages/inbox', 'messages', '']) await rmdir(join(fixture, p));
+    }
+  });
   test('filters by participant, full text and inclusive local dates with literal SQL input', async () => {
     const result = await (await app.request('/messages?person=Example&since=2014-10-16&until=2014-10-16')).json();
     expect(result.count).toBe(3);
@@ -116,5 +146,15 @@ suite('Facebook PostgreSQL import and search', () => {
     expect(sessions.status).toBe(200);
     const facebook = await api.fetch(new Request('http://localhost/facebook/messages?search=reconciliation'));
     expect((await facebook.json()).count).toBe(1);
+  });
+  test('does not expose Facebook responses through the existing wildcard browser CORS policy', async () => {
+    process.env.DATABASE_URL = url;
+    const { default: api } = await import('./api');
+    const headers = { Origin: 'https://outside.invalid' };
+    const facebook = await api.fetch(new Request('http://localhost/facebook/messages?limit=1', { headers }));
+    expect(facebook.status).toBe(200);
+    expect(facebook.headers.get('access-control-allow-origin')).toBeNull();
+    const sessions = await api.fetch(new Request('http://localhost/sessions?limit=1', { headers }));
+    expect(sessions.headers.get('access-control-allow-origin')).toBe('*');
   });
 });

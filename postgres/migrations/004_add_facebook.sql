@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS facebook_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_facebook_messages_conversation_date
     ON facebook_messages(conversation_id, sent_local, source_order DESC);
+CREATE INDEX IF NOT EXISTS idx_facebook_messages_conversation_instant
+    ON facebook_messages(conversation_id, sent_at, source_order DESC);
 CREATE INDEX IF NOT EXISTS idx_facebook_messages_search ON facebook_messages USING GIN(search_vector);
 
 COMMIT;

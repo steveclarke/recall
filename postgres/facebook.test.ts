@@ -28,6 +28,16 @@ describe('Facebook source fidelity', () => {
     expect(result.participants).toEqual([]);
     expect(result.messages[0].sender).toBeNull();
   });
+  test('rejects undated attachment-only cards and unsupported HTML instead of losing entries', async () => {
+    await expect(parseFacebookHtml('<title></title><div class="pam"><div class="_2lel"></div><div class="_2let"><img src="files/example.jpg"></div><div class="_3-94"></div></div>', 'UTC')).rejects.toThrow('no date');
+    await expect(parseFacebookHtml('<title>A</title><p>unrecognized export</p>', 'UTC')).rejects.toThrow('No supported');
+  });
+  test('preserves authored edge spaces, nonbreaking spaces and newlines exactly', async () => {
+    const result = await parseFacebookHtml(`<title>A</title>${htmlMessage('<div>&nbsp;&nbsp;indented&nbsp;</div>')}${htmlMessage('\n  line one\nline two  \n')}${htmlMessage('<br>edge<br>')}`, 'UTC');
+    expect(result.messages[0].content).toBe('\u00a0\u00a0indented\u00a0');
+    expect(result.messages[1].content).toBe('\n  line one\nline two  \n');
+    expect(result.messages[2].content).toBe('\nedge\n');
+  });
   test('requires dates for message cards, excluding participant headers', async () => {
     await expect(parseFacebookHtml('<title>Group</title><div class="pam"><div class="_2lek">Participants: A and B</div><div class="_3-94"></div></div>', 'America/St_Johns')).resolves.toMatchObject({ participants: ['A', 'B'], messages: [] });
     await expect(parseFacebookHtml('<title>A</title><div class="pam"><div class="_2lel">A</div><div class="_2let">lost date</div></div>', 'America/St_Johns')).rejects.toThrow('no date');
