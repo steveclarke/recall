@@ -9,6 +9,7 @@
     "sync": "bun run sync.ts",
     "serve": "bun run api.ts",
     "facebook:import": "bun run facebook-import.ts",
+    "facebook:repair-local-time": "bun run facebook-repair-local-time.ts",
     "test:facebook": "bun test facebook.test.ts facebook.integration.test.ts"
   },
   "dependencies": {

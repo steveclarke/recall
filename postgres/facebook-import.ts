@@ -24,7 +24,11 @@ export async function importFacebookArchive(sql: Sql, archive: FacebookArchive) 
       for (let i = 0; i < conversation.messages.length; i += 250) {
         const rows = conversation.messages.slice(i, i + 250).map(m => ({
           id: m.id, conversation_id: conversation.id, sender: m.sender, content: m.content,
-          sent_at: m.sentAt, sent_local: m.sentLocal, precision: m.precision,
+          sent_at: m.sentAt,
+          // OID 1114 is timestamp WITHOUT time zone. postgres.js serializes it
+          // through Date; Z makes that serialization independent of client TZ.
+          // PostgreSQL ignores the suffix for this explicit parameter type.
+          sent_local: tx.typed(`${m.sentLocal}Z`, 1114), precision: m.precision,
           attachments: tx.json(m.attachments), source_file: m.sourceFile, source_order: m.sourceOrder,
           payload: tx.json(m.payload),
         }));

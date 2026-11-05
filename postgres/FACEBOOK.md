@@ -82,3 +82,21 @@ Without `FACEBOOK_TEST_DATABASE_URL`, database tests are explicitly skipped. The
 Studio-local real-data verification imports the archive into a disposable PostgreSQL 18 container and queries the API over loopback HTTP. The February 2021 snapshot must read back as 696 conversations and 143,853 message entries. Known direct threads must retain 37 and 311 entries, respectively. Re-import must add no records. The June 2020 JSON dry run must retain 139,769 entries. Private data and proof captures stay outside Git.
 
 Production migration, import, deployment and production backup restoration are untested until separately approved and executed. Local proof does not establish production availability.
+
+## Repair earlier local-time imports
+
+The original importer can shift `sent_local` when the importing client uses a non-UTC timezone. Exact `sent_at` instants and source files remain intact. The corrected importer transports the wall-clock fields as an explicit PostgreSQL timestamp-without-time-zone parameter, independent of client and database timezones.
+
+The repair defaults to inspection:
+
+```sh
+bun run facebook:repair-local-time
+```
+
+After backup and approval of the live correction:
+
+```sh
+bun run facebook:repair-local-time --apply
+```
+
+Both commands require an explicit `DATABASE_URL`. The report counts messages, mismatches and unresolved UTC instants without printing message text. Apply takes the same transaction-level lock as imports, corrects only `sent_local` from each exact instant and export timezone, and verifies the remaining mismatch count. An apply with any unresolved instant fails before changing rows; that case needs source-based recovery. Repeating a completed repair changes zero rows. Other columns and Claude sessions are outside the update.
