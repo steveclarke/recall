@@ -1,6 +1,6 @@
 # Facebook import verification
 
-Production migration, import, deployment and restore remain untested and unperformed. All data proof below comes from an isolated PostgreSQL 18 container and loopback HTTP API on the Mac Studio. No archive content is copied into this repository.
+The approved Facebook release, both snapshot imports and local-time correction are verified live on November 5, 2026. Facebook-only production backups restore successfully in isolated PostgreSQL 18 databases. A complete restore of the historical Claude database remains untested. No archive content is copied into this repository.
 
 ## November 5, 2026 local proof
 
@@ -21,9 +21,25 @@ Production migration, import, deployment and restore remain untested and unperfo
 - The expanded parser/import/API suite passes all 18 tests on Bun 1.4.4 and PostgreSQL 18. The final reviewed code passes 73 assertions, including authored edge br elements. It also passes on the deployed runtime line, Bun 1.3.14, in a read-only, resource-limited container with no external network and a disposable synthetic-only database.
 - The corrected parser again reads all 696 conversations and 143,853 entries from the real HTML snapshot. The corrected importer succeeds in a disposable Studio database. Loopback HTTP reproduces the counts, a known direct thread, original final text, search context and absence of wildcard CORS. No operational Recall database is changed.
 
-## Review and release
+## Initial pre-release review
 
 - The same independent reviewer returns source-only PASS on corrected implementation head `2c15e19df90f2a4fff27e86b740a5500a678104e`; the report is saved in `docs/facebook-review.md`. It performs no runtime checks and accesses no private data.
-- API route names remain proposed until approval for release.
+- API route names are proposed at this review stage; the approved release below adopts `/facebook`.
 - Original source zips, unpacked exports and private proof files stay outside Git.
-- The disposable API and database are removed after verification; a live Recall import is a separate approved step.
+- The disposable API and database are removed after local verification. Live import follows as a separate approved step below.
+
+## November 5, 2026 production release
+
+- The owner approves the `/facebook` prefix, deployment and both live imports. [PR 1](https://github.com/steveclarke/recall/pull/1) merges as `620998ca9c1a6dbcd407a5c7319d3d94e29fd904`. The live checkout and API files match the reviewed release.
+- Live API pagination confirms 696 conversations and 143,853 entries in the default February 2021 HTML snapshot. The separate June 2020 JSON snapshot has 693 conversations and 139,769 entries. The database holds 283,622 Facebook message records and retains the original 15,915 Claude sessions.
+- Live checks cover original message text, person/date/text search, conversation context, existing health and session routes, and the Facebook browser CORS policy.
+- A fresh full pre-import dump passes a complete compressed-payload read. It is not fully restored. A Facebook-only post-import dump restores into isolated PostgreSQL 18 and reproduces both snapshots' counts. The existing nightly backup includes the new tables; a new offsite copy is not verified here.
+
+## November 5, 2026 local-time correction
+
+- A later archive lookup finds shifted `sent_local` values. Exact UTC instants and source files remain correct. The importer fix and repair utility are independently reviewed; [PR 2](https://github.com/steveclarke/recall/pull/2) merges as `e56a9df4ff95d344595be4057708d32da0abd5d4`.
+- The old importer fails with a non-UTC importing client. The fix passes 21 focused tests and 90 assertions on Bun 1.3.14 and PostgreSQL 18 with `TZ=America/St_Johns`. Tests cover a non-UTC database zone, seasonal offsets, midnight boundaries, milliseconds and unresolved instants.
+- A fresh production backup restores into an isolated database. The repair there corrects 283,622 local fields, preserves the record count and every other message field's aggregate fingerprint, and changes zero rows on repeat. Original local times and a date-boundary query agree afterward. The live pre-repair audit matches the backup's full fingerprint.
+- The owner approves the live correction. Deployed importer and repair files match the reviewed source. Live apply corrects all 283,622 local fields, leaving zero mismatches or unresolved instants. The repeat dry run reports zero changes. The complete corrected live fingerprint matches the repaired copy; all fields other than `sent_local` match their pre-repair fingerprint.
+- Live HTTP checks confirm original local and UTC times, JSON milliseconds, original text and the local-calendar date filter. Health and existing session routes pass. The API stays running throughout the repair.
+- A fresh post-repair production dump restores into isolated PostgreSQL 18. Its 283,622 records match the complete corrected live fingerprint and have zero timestamp mismatches. Private backup files remain outside Git. Test databases, their network, temporary worktrees and merged feature branches are removed after proof.
