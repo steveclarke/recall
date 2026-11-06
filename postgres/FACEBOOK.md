@@ -1,12 +1,18 @@
 # Facebook conversations
 
-Facebook exports use dedicated tables inside the existing Recall database. Claude sessions keep their existing tables and importer.
+Facebook chats are live in dedicated tables inside the existing Recall database. The commands below inspect or import another snapshot; database writes require approval.
+
+## Live status
+
+The approved release and imports complete on November 5, 2026. The default February 2021 HTML snapshot holds 696 conversations and 143,853 message entries. The June 2020 JSON snapshot holds 693 conversations and 139,769 entries. They remain separate snapshots; default queries select only the newest one. Claude sessions keep their existing tables and importer.
+
+The local-time repair also completes on November 5. It corrects 283,622 stored wall times and leaves zero mismatches. Message text, exact UTC instants and all other message fields remain unchanged. Live HTTP checks and an isolated restore of the corrected Facebook backup pass. The [verification record](../docs/facebook-validation.md) separates local proof, live checks and restore limits.
 
 ## Install and inspect
 
 Run commands from `postgres/` with Bun 1.3 or later. `bun install --frozen-lockfile` installs Hono, postgres, the HTML entity decoder and the Temporal date library.
 
-The source is an unpacked personal export containing `messages/**/message_*.html` or `messages/**/message_*.json`. Source files are read only. Media is never loaded, uploaded or fetched; attachment paths and URLs remain references.
+The source is an unpacked personal export. It contains `messages/**/message_*.html` or `messages/**/message_*.json`. Source files are read only. Media is never loaded, uploaded or fetched. Attachment paths and URLs remain references.
 
 ```sh
 bun run facebook:import --source /path/to/unpacked-export \
@@ -26,11 +32,11 @@ bun run facebook:import --source /path/to/unpacked-export \
   --format html --export-date 2021-02-13 --timezone America/St_Johns --apply
 ```
 
-The file manifest, format, export date and time zone identify an immutable snapshot. Repeating the same import returns `already_imported`. Each message identifier includes its source file and position, so repeated identical messages remain distinct. A snapshot commits in one transaction; failure rolls back the complete snapshot. Changed sources create a new snapshot rather than editing an existing one. Import the newest export first, then older snapshots when useful.
+The file manifest, format, export date and time zone identify an immutable snapshot. Repeating the same import returns `already_imported`. Each message identifier includes its source file and position. Repeated identical messages remain distinct. A snapshot commits in one transaction. Failure rolls back the complete snapshot. Changed sources create a new snapshot rather than editing an existing one. Import the newest export first, then older snapshots when useful.
 
 ## Search API
 
-The existing Recall API gains these proposed routes after deployment. These private routes do not opt into the existing session API's wildcard browser CORS policy; agents and CLI clients can query them over the approved private network:
+The live Recall API provides these routes. Agents and CLI clients can query them over the approved private network. The Facebook routes do not enable the existing session API's wildcard browser CORS policy:
 
 | Route | Result |
 | --- | --- |
@@ -54,7 +60,7 @@ Conversations and messages accept inclusive local calendar dates through `since=
 /facebook/conversations/CONVERSATION_ID/messages?around=MESSAGE_ID&before=5&after=5
 ```
 
-An `around` query returns up to 49 messages before and after the match, plus the match itself. Without `around`, offset pagination applies. JSON conversation pages and context use exact UTC instants, with source order breaking equal timestamps. HTML conversation pages and context reverse the export's newest-first source order, including during ambiguous DST wall times. Message search orders JSON by exact instant and HTML by local wall time; the latter cannot establish an exact cross-conversation order during a DST fold. Source file and order identify each original entry; the export manifest records file hashes and the source directory.
+An `around` query returns up to 49 messages before and after the match, plus the match itself. Without `around`, offset pagination applies. JSON conversation pages and context use exact UTC instants. Source order breaks ties for equal timestamps. HTML conversation pages and context reverse the export's newest-first source order. This also applies during ambiguous daylight-saving wall times. Message search orders JSON by exact instant and HTML by local wall time. HTML cannot establish an exact order across conversations during a daylight-saving rollback. Source file and order identify each original entry. The export manifest records file hashes and the source directory.
 
 ## Fidelity and scope
 
@@ -65,7 +71,7 @@ An `around` query returns up to 49 messages before and after the match, plus the
 - Exports are independently searchable snapshots. Automatic cross-export merging is deliberately absent: changed names, minute-versus-millisecond timestamps, attachment representations and repeated text make guessed merging unsafe. Earlier missing messages can be investigated with an explicit export filter.
 - Photos, posts and comments outside message threads are outside this importer. No external URLs are requested and no media download route is added.
 
-The tables are part of `claude_sessions`, so the existing whole-database `pg_dump` backup includes them after a live import. Source media stays outside that dump and requires the original archive backup. The source directory in a manifest may name another machine after an approved deployment; these references are provenance, not an assurance that the API host can open that path.
+The tables are part of `claude_sessions`. The existing whole-database `pg_dump` backup includes them. Source media stays outside that dump and requires the original archive backup. The source directory in a manifest may name another machine after deployment. It records where the imported files came from. The API host may not be able to open that path.
 
 ## Verification
 
@@ -81,11 +87,11 @@ Without `FACEBOOK_TEST_DATABASE_URL`, database tests are explicitly skipped. The
 
 Studio-local real-data verification imports the archive into a disposable PostgreSQL 18 container and queries the API over loopback HTTP. The February 2021 snapshot must read back as 696 conversations and 143,853 message entries. Known direct threads must retain 37 and 311 entries, respectively. Re-import must add no records. The June 2020 JSON dry run must retain 139,769 entries. Private data and proof captures stay outside Git.
 
-Production migration, import, deployment and production backup restoration are untested until separately approved and executed. Local proof does not establish production availability.
+The [verification record](../docs/facebook-validation.md) records the approved live migration, imports, deployment and timestamp correction on November 5, 2026. Production checks cover both snapshot counts, original text, search, date filters, conversation context and existing session routes. Facebook-only production dumps restore successfully in an isolated database. A complete restore of the historical Claude database remains untested. Future deployments and production writes still require approval and fresh read-back checks.
 
 ## Repair earlier local-time imports
 
-The original importer can shift `sent_local` when the importing client uses a non-UTC timezone. Exact `sent_at` instants and source files remain intact. The corrected importer transports the wall-clock fields as an explicit PostgreSQL timestamp-without-time-zone parameter, independent of client and database timezones.
+The original importer can shift `sent_local` when the importing client uses a non-UTC timezone. Exact `sent_at` instants and source files remain intact. The corrected importer uses an explicit PostgreSQL timestamp-without-time-zone parameter. This keeps wall-clock fields independent of client and database timezones.
 
 The repair defaults to inspection:
 
@@ -99,4 +105,4 @@ After backup and approval of the live correction:
 bun run facebook:repair-local-time --apply
 ```
 
-Both commands require an explicit `DATABASE_URL`. The report counts messages, mismatches and unresolved UTC instants without printing message text. Apply takes the same transaction-level lock as imports, corrects only `sent_local` from each exact instant and export timezone, and verifies the remaining mismatch count. An apply with any unresolved instant fails before changing rows; that case needs source-based recovery. Repeating a completed repair changes zero rows. Other columns and Claude sessions are outside the update.
+Both commands require an explicit `DATABASE_URL`. The report counts messages, mismatches and unresolved UTC instants without printing message text. Apply takes the same transaction-level lock as imports. It corrects only `sent_local` from each exact instant and export timezone, then verifies the remaining mismatch count. An apply with any unresolved instant fails before changing rows. That case needs source-based recovery. Repeating a completed repair changes zero rows. Other columns and Claude sessions are outside the update.
